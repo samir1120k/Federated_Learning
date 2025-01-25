@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 from queue import Queue
 import time
+import select
 
 # CNN Model Definition
 class CNN(nn.Module):
@@ -29,7 +30,6 @@ class CNN(nn.Module):
         x = self.fc2(x)
         return x
 
-
 # Global Variables
 global_model = CNN()
 clients = {}
@@ -41,13 +41,14 @@ def save_model_to_file(model, filename="global_model.pt"):
 
 def load_model_from_file(model, filename):
     try:
-        model.load_state_dict(torch.load(filename,weights_only=True))
-        print(f"Model weights loaded successfully from {filename}.")
+        model.load_state_dict(torch.load(filename, weights_only=True))
+        # print(f"Model weights loaded successfully from {filename}.")
     except Exception as e:
         print(f"Error loading model weights: {e}")
 
 def send_model(client_socket):  # Function to send the global model to a client
     try:
+        client_socket.setblocking(True)  # Set blocking mode
         filename = "global_model.pt"
         save_model_to_file(global_model, filename)
         filesize = os.path.getsize(filename)
@@ -62,12 +63,14 @@ def send_model(client_socket):  # Function to send the global model to a client
                 client_socket.sendall(chunk)
 
         print("Model sent successfully to:", client_socket.getpeername())
-
     except Exception as e:
         print(f"Error sending model: {e}")
 
+
 def receive_model(client_socket):
     try:
+        client_socket.setblocking(True)  # Set blocking mode
+
         # Receive metadata with a fixed buffer and retry if incomplete
         metadata = b""
         while b"\n" not in metadata:
@@ -133,7 +136,6 @@ def select_and_notify_clients():
         return
 
     selected_clients = random.sample(list(clients.values()), 2)
-    # for i in range(2):
     for client in selected_clients:
         client_socket = client['socket']
         send_model(client_socket)
@@ -143,31 +145,50 @@ def select_and_notify_clients():
             print(f"Model received from {client_socket.getpeername()}.")
             model_updates.put(model_state)  # Store the received model state
 
+import select
+
 def main():
     host = "127.0.0.1"
     port = 12345
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.bind((host, port))
     server_socket.listen(10)
+    server_socket.setblocking(False)  # Set the server socket to non-blocking mode
     print("Server is running...")
 
     try:
-        while True:
-            client_socket, client_address = server_socket.accept()
-            print(f"Accepted connection from {client_address}")
-            client_handler = threading.Thread(target=handle_client, args=(client_socket, client_address))
-            client_handler.start()
+        for i in range(2):
+            while True:
+                start = time.time()
+                end = time.time() + 30  # Run for 30 seconds
 
-            # After receiving 3 clients, select and notify
-            if len(clients) == 2:
-                # for i in range(2):
-                select_and_notify_clients()
-                aggregate_models(global_model, model_updates, 2)
-                # time.sleep(30)
+                while time.time() <= end:
+                    try:
+                        # Use select to wait for a client connection with a timeout of 1 second
+                        readable, _, _ = select.select([server_socket], [], [], 1)
+                        
+                        if readable:
+                            client_socket, client_address = server_socket.accept()
+                            print(f"Accepted connection from {client_address}")
+                            client_handler = threading.Thread(target=handle_client, args=(client_socket, client_address))
+                            client_handler.start()
+
+                    except select.error as e:
+                        # Handle errors with select or socket
+                        print(f"Error: {e}")
+                        continue
+
+                # After receiving 2 clients, select and notify
+                if len(clients) >= 2:
+                    select_and_notify_clients()
+                    aggregate_models(global_model, model_updates, 2)
+                else:
+                    print("Not enough clients connected to proceed.")
                 break  # Stop accepting new clients after selection
 
     finally:
         server_socket.close()
+
 
 if __name__ == "__main__":
     main()

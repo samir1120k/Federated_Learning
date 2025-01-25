@@ -6,6 +6,8 @@ import torch
 import torch.nn as nn
 from queue import Queue
 import time
+import select
+import pandas as pd
 
 # CNN Model Definition
 class CNN(nn.Module):
@@ -29,7 +31,6 @@ class CNN(nn.Module):
         x = self.fc2(x)
         return x
 
-
 # Global Variables
 global_model = CNN()
 clients = {}
@@ -41,13 +42,14 @@ def save_model_to_file(model, filename="global_model.pt"):
 
 def load_model_from_file(model, filename):
     try:
-        model.load_state_dict(torch.load(filename,weights_only=True))
-        print(f"Model weights loaded successfully from {filename}.")
+        model.load_state_dict(torch.load(filename, weights_only=True))
+        # print(f"Model weights loaded successfully from {filename}.")
     except Exception as e:
         print(f"Error loading model weights: {e}")
 
 def send_model(client_socket):  # Function to send the global model to a client
     try:
+        client_socket.setblocking(True)  # Set blocking mode
         filename = "global_model.pt"
         save_model_to_file(global_model, filename)
         filesize = os.path.getsize(filename)
@@ -62,12 +64,14 @@ def send_model(client_socket):  # Function to send the global model to a client
                 client_socket.sendall(chunk)
 
         print("Model sent successfully to:", client_socket.getpeername())
-
     except Exception as e:
         print(f"Error sending model: {e}")
 
+
 def receive_model(client_socket):
     try:
+        client_socket.setblocking(True)  # Set blocking mode
+
         # Receive metadata with a fixed buffer and retry if incomplete
         metadata = b""
         while b"\n" not in metadata:
@@ -132,16 +136,74 @@ def select_and_notify_clients():
         print("Not enough clients connected for selection.")
         return
 
+    # Select random clients
     selected_clients = random.sample(list(clients.values()), 2)
-    # for i in range(2):
+
+    # Send the model to all selected clients
     for client in selected_clients:
         client_socket = client['socket']
-        send_model(client_socket)
+        try:
+            print(f"Sending model to {client_socket.getpeername()}...")
+            send_model(client_socket)
+        except Exception as e:
+            print(f"Error sending model to {client_socket.getpeername()}: {e}")
+            return  # Exit if unable to send the model
 
-        model_state = receive_model(client_socket)  # Receive model from the client
-        if model_state:
-            print(f"Model received from {client_socket.getpeername()}.")
-            model_updates.put(model_state)  # Store the received model state
+    # Wait to receive the model from all selected clients
+    received_models = []
+    for client in selected_clients:
+        client_socket = client['socket']
+        try:
+            print(f"Waiting to receive model from {client_socket.getpeername()}...")
+            model_state = receive_model(client_socket)
+            if model_state:
+                print(f"Model received from {client_socket.getpeername()}.")
+                received_models.append(model_state)
+        except Exception as e:
+            print(f"Error receiving model from {client_socket.getpeername()}: {e}")
+
+    # Check if all selected clients sent their models
+    if len(received_models) == len(selected_clients):
+        for model_state in received_models:
+            model_updates.put(model_state)  # Store received models in the queue
+    else:
+        print("Not all clients responded with their models.")
+        for model_state in received_models:
+            model_updates.put(model_state)
+
+
+
+test_data=pd.read_csv(r'Test_Dataset.csv')
+
+def measure_model(global_model):
+
+    X_test = torch.tensor(test_data.iloc[:, 1:].values, dtype=torch.float32)
+    y_test = torch.tensor(test_data.iloc[:, 0].values, dtype=torch.long)
+
+    # Reshape data for convolutional layers (assuming 28x28 images)
+    X_test = X_test.view(-1, 1, 28, 28)  # Reshape to (batch_size, channels, height, width)
+
+    # Create a DataLoader for efficient batching
+    test_loader = torch.utils.data.DataLoader(
+        list(zip(X_test, y_test)), batch_size=32, shuffle=False
+    )
+
+    global_model.eval()
+    with torch.no_grad():
+      total_test_loss = 0
+      correct_test_predictions = 0
+      for data, target in test_loader:
+        outputs = global_model(data)
+        loss = nn.CrossEntropyLoss(outputs, target)
+        total_test_loss += loss.item() * data.size(0)
+        _, predicted = torch.max(outputs.data, 1)
+        correct_test_predictions += (predicted == target).sum().item()
+
+    # Calculate average test loss and accuracy
+    test_loss = total_test_loss / len(test_data)
+    test_accuracy = 100.0 * correct_test_predictions / len(test_data)
+
+    print(f"Test Loss: {test_loss:.4f}, Test Acc: {test_accuracy:.2f}%")
 
 def main():
     host = "127.0.0.1"
@@ -149,22 +211,38 @@ def main():
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.bind((host, port))
     server_socket.listen(10)
+    server_socket.setblocking(False)  # Set the server socket to non-blocking mode
     print("Server is running...")
 
     try:
-        while True:
-            client_socket, client_address = server_socket.accept()
-            print(f"Accepted connection from {client_address}")
-            client_handler = threading.Thread(target=handle_client, args=(client_socket, client_address))
-            client_handler.start()
+        for i in range(2):
+            while True:
+                start = time.time()
+                end = time.time() + 30  # Run for 30 seconds
 
-            # After receiving 3 clients, select and notify
-            if len(clients) == 2:
-                # for i in range(2):
-                select_and_notify_clients()
-                aggregate_models(global_model, model_updates, 2)
-                # time.sleep(30)
-                break  # Stop accepting new clients after selection
+                while time.time() <= end:
+                    try:
+                        # Use select to wait for a client connection with a timeout of 1 second
+                        readable, _, _ = select.select([server_socket], [], [], 1)
+                        
+                        if readable:
+                            client_socket, client_address = server_socket.accept()
+                            print(f"Accepted connection from {client_address}")
+                            client_handler = threading.Thread(target=handle_client, args=(client_socket, client_address))
+                            client_handler.start()
+
+                    except select.error as e:
+                        # Handle errors with select or socket
+                        print(f"Error: {e}")
+                        continue
+
+                # After receiving enough clients, select, notify, and aggregate
+                if len(clients) >= 2:
+                    select_and_notify_clients()
+                    if not model_updates.empty():
+                        aggregate_models(global_model, model_updates, model_updates.qsize())
+                else:
+                    print("Not enough clients connected to proceed.")
 
     finally:
         server_socket.close()
